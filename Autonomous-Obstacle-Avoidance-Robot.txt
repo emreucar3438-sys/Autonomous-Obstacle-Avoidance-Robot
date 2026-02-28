@@ -1,193 +1,146 @@
-/**
- * @file RobotController.ino
- * @author Your Name / GitHub Username
- * @brief Advanced Obstacle Avoidance Robot with Moving Average Filtering
- * @version 1.0
- * @date 2024-05-23
- * * Features:
- * - Signal Filtering: Uses a circular buffer to implement a Moving Average Filter for sonar stability.
- * - Dynamic Speed Control: Adjusts PWM velocity based on the proximity of obstacles.
- * - State Management: Uses an Enum-based state machine for cleaner logic flow.
+
+/*
+ * Autonomous Obstacle Avoidance Robot - R&D Project
+ * Filter Stack: Median Filter + Exponential Moving Average (EMA)
  */
 
 #include <NewPing.h>
 #include <Servo.h>
 
-// --- HARDWARE CONFIGURATION ---
-#define TRIGGER_PIN  12
-#define ECHO_PIN     11
-#define MAX_DISTANCE 200 // Maximum sensor range in cm
-#define FILTER_SIZE  5   // Number of samples for smoothing
+// --- Pin Definitions ---
+#define TRIGGER_PIN 12
+#define ECHO_PIN    11
+#define MAX_DISTANCE 200
 
-// --- MOTION CALIBRATION (PWM Duty Cycle: 0-255) ---
-#define SPEED_FAST   250  
-#define SPEED_MEDIUM 200  
-#define SPEED_SLOW   160  
-#define SPEED_STOP   0
+// Motor Driver Pins (L298N)
+const int leftForward  = 5;
+const int leftBackward = 6;
+const int rightForward = 7;
+const int rightBackward = 8;
+const int servoPin     = 10;
 
-// --- ENUMS & STRUCTURES ---
-enum MotionState { 
-    PATH_CLEAR, 
-    OBSTACLE_DETECTED, 
-    REVERSING, 
-    TURNING_LEFT, 
-    TURNING_RIGHT 
-};
+// --- Signal Processing Parameters ---
+#define FILTER_SIZE 5
+#define ALPHA 0.3f // EMA smoothing factor
 
-struct MotorSystem {
-    const int leftForward   = 5;
-    const int leftBackward  = 6;
-    const int rightForward  = 9;
-    const int rightBackward = 10;
-    int velocity = SPEED_MEDIUM; 
-};
+int distanceHistory[FILTER_SIZE];
+int historyIndex = 0;
+float filteredDistance = 0;
 
-// --- GLOBAL VARIABLES ---
-MotionState currentState = PATH_CLEAR;
-MotorSystem robot;
-const int servoPin = 3;
-
-// Sensor Filtering Variables
-int distanceHistory[FILTER_SIZE]; // Storage for the Moving Average Filter
-int *filterPointer = distanceHistory;  // Pointer for circular buffer efficiency
-
-unsigned long currentTime = 0;
-unsigned long lastExecutionTime = 0;
-
-// Object Instantiation
 NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE);
-Servo sensorServo;
+Servo headServo;
 
 void setup() {
-    // Initialize Circular Buffer with a safe default value (250cm)
-    for(int i = 0; i < FILTER_SIZE; i++) distanceHistory[i] = 250; 
-    
-    // Pin Configuration
-    pinMode(robot.leftForward, OUTPUT);
-    pinMode(robot.leftBackward, OUTPUT);
-    pinMode(robot.rightForward, OUTPUT);
-    pinMode(robot.rightBackward, OUTPUT);
-    
-    sensorServo.attach(servoPin);
-    sensorServo.write(90); // Center the ultrasonic sensor
-    
-    Serial.begin(9600); // For debugging
-    delay(2000);        // Brief safety delay
+  pinMode(leftForward, OUTPUT);
+  pinMode(leftBackward, OUTPUT);
+  pinMode(rightForward, OUTPUT);
+  pinMode(rightBackward, OUTPUT);
+  
+  headServo.attach(servoPin);
+  headServo.write(90); // Initial position
+  
+  delay(2000); // Startup delay
 }
 
 void loop() {
-    currentTime = millis();
-    
-    // Task Scheduling: Execute logic every 100ms for responsiveness
-    if(currentTime - lastExecutionTime >= 100) {
-        lastExecutionTime = currentTime;
-
-        // --- SENSOR DATA ACQUISITION & FILTERING ---
-        int rawPing = sonar.ping_cm();
-        *filterPointer = (rawPing == 0) ? MAX_DISTANCE : rawPing;
-        filterPointer++;
-        
-        // Reset pointer if it exceeds buffer size
-        if (filterPointer >= distanceHistory + FILTER_SIZE) {
-            filterPointer = distanceHistory;
-        }
-
-        // Calculate Average Distance (Smoothing out noise)
-        long sum = 0;
-        for (int i = 0; i < FILTER_SIZE; i++) sum += distanceHistory[i];
-        int smoothedDistance = (int)(sum / FILTER_SIZE);
-
-        // --- DECISION LOGIC ENGINE ---
-        if (smoothedDistance < 30) {
-            stopRobot();             
-            delay(500);              
-            robot.velocity = SPEED_SLOW; 
-            handleObstacleAvoidance();        
-        } 
-        else if (smoothedDistance < 60) {
-            robot.velocity = SPEED_MEDIUM; 
-            moveForward();
-        } 
-        else {
-            robot.velocity = SPEED_FAST; 
-            moveForward();
-        }
-    }
+  // 1. Data Acquisition & Circular Buffer Update
+  int rawDistance = sonar.ping_cm();
+  
+  // Handle out of range values
+  if (rawDistance == 0) rawDistance = MAX_DISTANCE;
+  
+  distanceHistory[historyIndex] = rawDistance;
+  historyIndex = (historyIndex + 1) % FILTER_SIZE;
+  
+  // 2. Median Filtering: Eliminates sensor spikes (salt-and-pepper noise)
+  int medianValue = calculateMedian(distanceHistory, FILTER_SIZE);
+  
+  // 3. EMA Filtering: Provides temporal smoothing for fluid motion
+  // Formula: EMA = (α * new_sample) + ((1 - α) * previous_EMA)
+  filteredDistance = (ALPHA * medianValue) + ((1.0 - ALPHA) * filteredDistance);
+  
+  // 4. Decision Logic
+  if (filteredDistance > 0 && filteredDistance < 30) {
+    avoidObstacle();
+  } else {
+    moveForward();
+  }
+  
+  delay(30); // Sampling period
 }
 
-/**
- * @brief Scans surroundings and decides the best path to avoid obstacles.
- */
-void handleObstacleAvoidance() {
-    stopRobot();
-    delay(500);
-    moveBackward();
-    delay(400);
-    stopRobot();
-    
-    // Scan Environment
-    sensorServo.write(20); // Look Right
-    delay(500);
-    int distRight = sonar.ping_cm();
-    if (distRight == 0) distRight = MAX_DISTANCE;
-    
-    sensorServo.write(160); // Look Left
-    delay(700);
-    int distLeft = sonar.ping_cm();
-    if (distLeft == 0) distLeft = MAX_DISTANCE;
-    
-    sensorServo.write(90); // Recenter
-    delay(500);
-    
-    // Navigate towards the clearer path
-    if(distRight >= distLeft) {
-        turnRight();
-    } else {
-        turnLeft();
+// Median calculation using Bubble Sort (Efficient for small N)
+int calculateMedian(int arr[], int n) {
+  int temp[n];
+  for (int i = 0; i < n; i++) temp[i] = arr[i];
+
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - i - 1; j++) {
+      if (temp[j] > temp[j + 1]) {
+        int t = temp[j];
+        temp[j] = temp[j + 1];
+        temp[j + 1] = t;
+      }
     }
-    
-    delay(600); 
-    stopRobot();
+  }
+  return temp[n / 2];
 }
 
-// --- ACTUATOR ABSTRACTION LAYER ---
 
+
+void avoidObstacle() {
+  stopMotors();
+  delay(200);
+  moveBackward();
+  delay(400);
+  stopMotors();
+  
+  // Environment Scanning
+  headServo.write(20); // Scan Right
+  delay(500);
+  int rightDistance = sonar.ping_cm();
+  if (rightDistance == 0) rightDistance = MAX_DISTANCE;
+  
+  headServo.write(160); // Scan Left
+  delay(700);
+  int leftDistance = sonar.ping_cm();
+  if (leftDistance == 0) leftDistance = MAX_DISTANCE;
+  
+  headServo.write(90); // Reset position
+  delay(400);
+  
+  // Pathfinding decision
+  if (rightDistance >= leftDistance) {
+    turnRight();
+  } else {
+    turnLeft();
+  }
+  delay(500); // Turning duration
+  stopMotors();
+}
+
+// --- Primitive Motor Control Functions ---
 void moveForward() {
-    currentState = PATH_CLEAR;
-    analogWrite(robot.leftForward, robot.velocity);
-    analogWrite(robot.rightForward, robot.velocity);
-    digitalWrite(robot.leftBackward, LOW);
-    digitalWrite(robot.rightBackward, LOW);
+  digitalWrite(leftForward, HIGH); digitalWrite(rightForward, HIGH);
+  digitalWrite(leftBackward, LOW); digitalWrite(rightBackward, LOW);
 }
 
 void moveBackward() {
-    currentState = REVERSING;
-    digitalWrite(robot.leftForward, LOW);
-    analogWrite(robot.leftBackward, robot.velocity);
-    digitalWrite(robot.rightForward, LOW);
-    analogWrite(robot.rightBackward, robot.velocity);
+  digitalWrite(leftForward, LOW);  digitalWrite(rightForward, LOW);
+  digitalWrite(leftBackward, HIGH); digitalWrite(rightBackward, HIGH);
 }
 
 void turnRight() {
-    currentState = TURNING_RIGHT;
-    analogWrite(robot.leftForward, robot.velocity);
-    digitalWrite(robot.leftBackward, LOW);
-    digitalWrite(robot.rightForward, LOW);
-    analogWrite(robot.rightBackward, robot.velocity);
+  digitalWrite(leftForward, HIGH); digitalWrite(rightBackward, HIGH);
+  digitalWrite(leftBackward, LOW);  digitalWrite(rightForward, LOW);
 }
 
 void turnLeft() {
-    currentState = TURNING_LEFT;
-    digitalWrite(robot.leftForward, LOW);
-    analogWrite(robot.leftBackward, robot.velocity);
-    analogWrite(robot.rightForward, robot.velocity);
-    digitalWrite(robot.rightBackward, LOW);
+  digitalWrite(leftForward, LOW);   digitalWrite(rightBackward, LOW);
+  digitalWrite(leftBackward, HIGH);  digitalWrite(rightForward, HIGH);
 }
 
-void stopRobot() {
-    currentState = OBSTACLE_DETECTED;
-    digitalWrite(robot.leftForward, LOW);
-    digitalWrite(robot.leftBackward, LOW);
-    digitalWrite(robot.rightForward, LOW);
-    digitalWrite(robot.rightBackward, LOW);
+void stopMotors() {
+  digitalWrite(leftForward, LOW); digitalWrite(rightForward, LOW);
+  digitalWrite(leftBackward, LOW); digitalWrite(rightBackward, LOW);
 }
